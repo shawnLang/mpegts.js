@@ -7,14 +7,31 @@
     <link rel="stylesheet" type="text/css" href="demo.css" />
 </head>
 
+<style>
+    .box {
+        border: 2px solid blue;
+        position: absolute;
+        width: 100px;
+        height: 100px;
+        z-index: 999;
+        top: 200px;
+        left: 200px;
+    }
+    .canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 1;
+    }
+</style>
+
 <body>
-    
     <div class="mainContainer">
         <div>
             <div id="streamURL">
                 <div class="url-input">
                     <label for="sURL">Stream URL:</label>
-                    <input id="sURL" type="text" value="http://127.0.0.1/flv/7182741-1.flv" />
+                    <input id="sURL" type="text" value="ws://192.168.1.122:6083/jessica/live/test1.flv" />
                     <button onclick="switch_mds()">Switch to MediaDataSource</button>
                 </div>
                 <div class="options">
@@ -39,6 +56,11 @@
                 <video name="videoElement" class="centeredVideo" controls autoplay>
                     Your browser is too old which doesn't support HTML5 video.
                 </video>
+                <div id="box">
+                    <div class="box">
+                    </div>
+                </div>
+                <!-- <canvas id="overlay" class="canvas"></canvas> -->
             </div>
         </div>
         <div class="controls">
@@ -57,6 +79,7 @@
     <script>
         var checkBoxFields = ['isLive', 'withCredentials', 'liveBufferLatencyChasing'];
         var streamURL, mediaSourceURL;
+        var canvas = document.getElementById('overlay');
 
         function player_load() {
             console.log('isSupported: ' + mpegts.isSupported());
@@ -85,6 +108,7 @@
                 console.log('MediaDataSource', mediaDataSource);
                 player_load_mds(mediaDataSource);
             }
+            
         }
 
         function player_load_mds(mediaDataSource) {
@@ -97,6 +121,19 @@
                     player = null;
                 }
             }
+            console.log(element.offsetWidth, element.offsetHeight)
+            // canvas.width = element.offsetWidth;
+            // canvas.height = element.offsetHeight;
+            // window.addEventListener('resize', function() {
+            //     canvas.width = element.offsetWidth;
+            //     canvas.height = element.offsetHeight;
+            // });
+            // let ctx = canvas.getContext('2d');
+
+            // // 绘制一个矩形框
+            // ctx.strokeStyle = 'blue';
+            // ctx.strokeRect(200, 200, 100, 100);
+
             player = mpegts.createPlayer(mediaDataSource, {
                 enableWorker: true,
                 lazyLoadMaxDuration: 3 * 60,
@@ -105,6 +142,29 @@
             });
             player.attachMediaElement(element);
             player.load();
+            // player.on(mpegts.Events.PES_PRIVATE_DATA_ARRIVED, function(data) {
+            //     console.log(data)
+            // });
+            // player.on(mpegts.Events.STATISTICS_INFO, function(data) {
+            //     console.log(data)
+            // });
+
+            player.on('sei_info', function(data) {
+                console.log(data)
+                const seiDataStr =  String.fromCharCode(...data.dataContent);
+                console.log(String.fromCharCode(...data.dataContent))
+                const arr = JSON.parse(seiDataStr);
+                document.getElementById('box').innerHTML = ''
+                for(let i = 0; i < arr.length; i++) {
+                    if(arr[i].head) {
+                        create(element.offsetWidth, element.offsetHeight, arr[i].head)
+                    }
+                }
+                
+            });
+
+            
+            // mpegts.setExportVideoTrackFunction(getVideoTrack)
         }
 
         function player_start() {
@@ -230,6 +290,22 @@
             showVersion();
             player_load();
         });
+
+        function create(width, height, data) {
+            if (data.x && data.y && data.w && data.h) {
+                var div = document.createElement("div");//创建一个标签
+                div.style.position = 'absolute';
+                div.style.top = width * data.x + 'px';
+                div.style.left = height * data.y + 'px';
+                div.style.border = '2px solid blue'
+                div.style.zIndex = 10
+                div.style.width = width * data.w + 'px'
+                div.style.height = height * data.h + 'px';
+                document.getElementById('box').appendChild(div)
+            } else {
+                console.log("不合法的data：" + data)
+            }
+        }
     </script>
     
 </body>

@@ -27,6 +27,7 @@ import MSEEvents from '../core/mse-events.js';
 import {ErrorTypes, ErrorDetails} from './player-errors.js';
 import {createDefaultConfig} from '../config.js';
 import {InvalidArgumentException, IllegalStateException} from '../utils/exception.js';
+import SeiEventEmitter from '../sei.js'
 
 class MSEPlayer {
 
@@ -109,6 +110,7 @@ class MSEPlayer {
 
         this._emitter.removeAllListeners();
         this._emitter = null;
+        SeiEventEmitter.remove()
     }
 
     on(event, listener) {
@@ -124,6 +126,9 @@ class MSEPlayer {
                     this._emitter.emit(PlayerEvents.STATISTICS_INFO, this.statisticsInfo);
                 });
             }
+        } else if (event === TransmuxingEvents.SEI_INFO) {
+            SeiEventEmitter.emitter.addListener(event, listener);
+            return;
         }
         this._emitter.addListener(event, listener);
     }

@@ -21,6 +21,7 @@ import LoggingControl from '../utils/logging-control.js';
 import Polyfill from '../utils/polyfill.js';
 import TransmuxingController from './transmuxing-controller.js';
 import TransmuxingEvents from './transmuxing-events.js';
+import SeiEventEmitter from '../sei.js'
 
 /* post message to worker:
    data: {
@@ -63,6 +64,7 @@ let TransmuxingWorker = function (self) {
                 controller.on(TransmuxingEvents.PES_PRIVATE_DATA_ARRIVED, onPESPrivateDataArrived.bind(this));
                 controller.on(TransmuxingEvents.STATISTICS_INFO, onStatisticsInfo.bind(this));
                 controller.on(TransmuxingEvents.RECOMMEND_SEEKPOINT, onRecommendSeekpoint.bind(this));
+                controller.on(TransmuxingEvents.SEI_INFO, onSeiInfo.bind(this));
                 break;
             case 'destroy':
                 if (controller) {
@@ -232,6 +234,13 @@ let TransmuxingWorker = function (self) {
         self.postMessage({
             msg: TransmuxingEvents.RECOMMEND_SEEKPOINT,
             data: milliseconds
+        });
+    }
+
+    function onSeiInfo(data) {
+        self.postMessage({
+            msg: TransmuxingEvents.SEI_INFO,
+            data: data,
         });
     }
 

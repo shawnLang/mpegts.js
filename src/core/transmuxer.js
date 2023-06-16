@@ -24,6 +24,7 @@ import TransmuxingController from './transmuxing-controller.js';
 import TransmuxingEvents from './transmuxing-events.js';
 import TransmuxingWorker from './transmuxing-worker.js';
 import MediaInfo from './media-info.js';
+import SeiEventEmitter from '../sei.js'
 
 class Transmuxer {
 
@@ -50,7 +51,7 @@ class Transmuxer {
         } else {
             this._controller = new TransmuxingController(mediaDataSource, config);
         }
-
+        
         if (this._controller) {
             let ctl = this._controller;
             ctl.on(TransmuxingEvents.IO_ERROR, this._onIOError.bind(this));
@@ -69,6 +70,7 @@ class Transmuxer {
             ctl.on(TransmuxingEvents.PES_PRIVATE_DATA_ARRIVED, this._onPESPrivateDataArrived.bind(this));
             ctl.on(TransmuxingEvents.STATISTICS_INFO, this._onStatisticsInfo.bind(this));
             ctl.on(TransmuxingEvents.RECOMMEND_SEEKPOINT, this._onRecommendSeekpoint.bind(this));
+            ctl.on(TransmuxingEvents.SEI_INFO, this._onSeiInfo.bind(this));
         }
     }
 
@@ -237,6 +239,12 @@ class Transmuxer {
         });
     }
 
+    _onSeiInfo(data) {
+        Promise.resolve().then(() => {
+            SeiEventEmitter.emitter.emit(TransmuxingEvents.SEI_INFO, data);
+        });
+    }
+
     _onLoggingConfigChanged(config) {
         if (this._worker) {
             this._worker.postMessage({cmd: 'logging_config', param: config});
@@ -286,6 +294,9 @@ class Transmuxer {
                 break;
             case 'logcat_callback':
                 Log.emitter.emit('log', data.type, data.logcat);
+                break;
+            case TransmuxingEvents.SEI_INFO:
+                SeiEventEmitter.emitter.emit(TransmuxingEvents.SEI_INFO, data);
                 break;
             default:
                 break;

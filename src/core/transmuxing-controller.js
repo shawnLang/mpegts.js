@@ -280,7 +280,7 @@ class TransmuxingController {
     }
 
     _setupFLVDemuxerRemuxer(probeData) {
-        this._demuxer = new FLVDemuxer(probeData, this._config);
+        this._demuxer = new FLVDemuxer(probeData, this._config, this._emitter);
 
         if (!this._remuxer) {
             this._remuxer = new MP4Remuxer(this._config);
