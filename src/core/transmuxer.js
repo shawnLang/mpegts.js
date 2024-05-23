@@ -24,7 +24,6 @@ import TransmuxingController from './transmuxing-controller.js';
 import TransmuxingEvents from './transmuxing-events';
 import TransmuxingWorker from './transmuxing-worker.js';
 import MediaInfo from './media-info.js';
-import SeiEventEmitter from '../sei.js'
 
 class Transmuxer {
 
@@ -255,7 +254,7 @@ class Transmuxer {
 
     _onSeiInfo(data) {
         Promise.resolve().then(() => {
-            SeiEventEmitter.emitter.emit(TransmuxingEvents.SEI_INFO, data);
+            this._emitter.emit(TransmuxingEvents.SEI_INFO, data);
         });
     }
 
@@ -312,7 +311,7 @@ class Transmuxer {
                 Log.emitter.emit('log', data.type, data.logcat);
                 break;
             case TransmuxingEvents.SEI_INFO:
-                SeiEventEmitter.emitter.emit(TransmuxingEvents.SEI_INFO, data);
+                this._emitter.emit(message.msg, data);
                 break;
             default:
                 break;

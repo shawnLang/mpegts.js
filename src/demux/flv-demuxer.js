@@ -1410,9 +1410,9 @@ class FLVDemuxer {
             if (unitType === 5) {  // IDR
                 keyframe = true;
             } else if (unitType === 6) {  // SEI
-                console.log('unitType===6的SEI');
+                //console.log('unitType===6的SEI');
                 let payloadType = v.getUint8(offset + lengthSize + 1);
-                console.log('payloadType', payloadType);
+                //console.log('payloadType', payloadType);
                 //在国标中。sei payload type为5，为自定义消息
                 if (payloadType === 5) {
                     //解析SEI 开始，根据协议进行解码
@@ -1500,6 +1500,39 @@ class FLVDemuxer {
 
             if (unitType === 19 || unitType === 20 || unitType === 21) {  // IRAP
                 keyframe = true;
+            } else if (unitType === 39 || unitType === 40) {  // SEI
+                //console.log('unitType===6的SEI');
+                let payloadType = v.getUint8(offset + lengthSize + 1);
+                //console.log('payloadType', payloadType);
+                //在国标中。sei payload type为5，为自定义消息
+                if (payloadType === 5) {
+                    //解析SEI 开始，根据协议进行解码
+                    let curOffset = offset + lengthSize + 2;
+                    // 解析负载长度
+                    let payloadContentLenght = 0
+                    while(v.getUint8(curOffset) == 0xff) {
+                        console.log(255)
+                        payloadContentLenght += 255
+                        curOffset++
+                    }
+                    payloadContentLenght += v.getUint8(curOffset);
+                    console.log('payloadContentLenght', payloadContentLenght);
+                    // uuid 16个字节 + content data
+                    // let uuid = '';
+                    // let hexString = '';
+                    // for (let i = 1; i <= 16; i++) {
+                    //     ++curOffset
+                    //     uuid += v.getUint8(curOffset);
+                    //     hexString += v.getUint8(curOffset).toString(16).padStart(2, '0');
+                    // }
+                    // console.log('uuid', uuid);
+                    // console.log('hexString', hexString);
+                    // let payloadContentDataLenght = payloadContentLenght - 16;
+                    //此处可以添加自己约定的解析逻辑，然后再导出
+                    let dataContent = new Uint8Array(arrayBuffer, dataOffset + curOffset + 1, payloadContentLenght);
+                    let result = {data: '解析的SEI数据结束', dataContent};
+                    this._emitter.emit('sei_info', result)
+                }
             }
 
             let data = new Uint8Array(arrayBuffer, dataOffset + offset, lengthSize + naluSize);
