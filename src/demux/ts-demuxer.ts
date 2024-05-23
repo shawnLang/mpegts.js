@@ -33,7 +33,13 @@ import H265Parser from './h265-parser';
 import { SMPTE2038Data, smpte2038parse } from './smpte2038';
 import { MP3Data } from './mp3';
 import { AC3Config, AC3Frame, AC3Parser, EAC3Config, EAC3Frame, EAC3Parser } from './ac3';
+import { KLVData, klv_parse } from './klv';
 
+type AdaptationFieldInfo = {
+    discontinuity_indicator?: number;
+    random_access_indicator?: number;
+    elementary_stream_priority_indicator?: number;
+};
 type AACAudioMetadata = {
     codec: 'aac',
     audio_object_type: MPEG4AudioObjectTypes;
@@ -129,7 +135,11 @@ class TSDemuxer extends BaseDemuxer {
         channel_config: undefined
     };
 
-    private aac_last_sample_pts_: number = undefined;
+    private last_pcr_: number | undefined;
+    private last_pcr_base_: number = NaN;
+    private timestamp_offset_: number = 0;
+
+    private audio_last_sample_pts_: number = undefined;
     private aac_last_incomplete_data_: Uint8Array = null;
 
     private has_video_ = false;
@@ -271,16 +281,28 @@ class TSDemuxer extends BaseDemuxer {
             let adaptation_field_control = (data[3] & 0x30) >>> 4;
             let continuity_conunter = (data[3] & 0x0F);
 
-            let adaptation_field_info: {
-                discontinuity_indicator?: number,
-                random_access_indicator?: number,
-                elementary_stream_priority_indicator?: number
-            } = {};
+            let is_pcr_pid: boolean = (this.pmt_ && this.pmt_.pcr_pid === pid) ? true : false;
+            let adaptation_field_info: AdaptationFieldInfo = {};
             let ts_payload_start_index = 4;
 
             if (adaptation_field_control == 0x02 || adaptation_field_control == 0x03) {
+                // Adaptation field exists along with / without payload
                 let adaptation_field_length = data[4];
-                if (5 + adaptation_field_length === 188) {
+                if (adaptation_field_length > 0 && (is_pcr_pid || adaptation_field_control == 0x03)) {
+                    // Parse adaptation field
+                    adaptation_field_info.discontinuity_indicator = (data[5] & 0x80) >>> 7;
+                    adaptation_field_info.random_access_indicator = (data[5] & 0x40) >>> 6;
+                    adaptation_field_info.elementary_stream_priority_indicator = (data[5] & 0x20) >>> 5;
+
+                    let PCR_flag = (data[5] & 0x10) >>> 4;
+                    if (PCR_flag) {
+                        let pcr_base = this.getPcrBase(data);
+                        let pcr_extension = ((data[10] & 0x01) << 8) | data[11];
+                        let pcr = pcr_base * 300 + pcr_extension;
+                        this.last_pcr_ = pcr;
+                    }
+                }
+                if (adaptation_field_control == 0x02 || 5 + adaptation_field_length === 188) {
                     // TS packet only has adaption field, jump to next
                     offset += 188;
                     if (this.ts_packet_size_ === 204) {
@@ -289,18 +311,15 @@ class TSDemuxer extends BaseDemuxer {
                     }
                     continue;
                 } else {
-                    // parse leading adaptation_field if has payload
-                    if (adaptation_field_length > 0) {
-                        adaptation_field_info = this.parseAdaptationField(chunk,
-                                                                          offset + 4,
-                                                                          1 + adaptation_field_length);
-                    }
+                    // Point ts_payload_start_index to the start of payload
                     ts_payload_start_index = 4 + 1 + adaptation_field_length;
                 }
             }
 
             if (adaptation_field_control == 0x01 || adaptation_field_control == 0x03) {
-                if (pid === 0 || pid === this.current_pmt_pid_ || (this.pmt_ != undefined && this.pmt_.pid_stream_type[pid] === StreamType.kSCTE35)) {  // PAT(pid === 0) or PMT or SCTE35
+                if (pid === 0 ||                      // PAT (pid === 0)
+                    pid === this.current_pmt_pid_ ||  // PMT
+                    (this.pmt_ != undefined && this.pmt_.pid_stream_type[pid] === StreamType.kSCTE35)) {  // SCTE35
                     let ts_payload_length = 188 - ts_payload_start_index;
 
                     this.handleSectionSlice(chunk,
@@ -328,7 +347,10 @@ class TSDemuxer extends BaseDemuxer {
                             || pid === this.pmt_.common_pids.opus
                             || pid === this.pmt_.common_pids.mp3
                             || this.pmt_.pes_private_data_pids[pid] === true
-                            || this.pmt_.timed_id3_pids[pid] === true) {
+                            || this.pmt_.timed_id3_pids[pid] === true
+                            || this.pmt_.synchronous_klv_pids[pid] === true
+                            || this.pmt_.asynchronous_klv_pids[pid] === true
+                            ) {
                         this.handlePESSlice(chunk,
                                             offset + ts_payload_start_index,
                                             ts_payload_length,
@@ -356,34 +378,6 @@ class TSDemuxer extends BaseDemuxer {
         this.dispatchAudioVideoMediaSegment();
 
         return offset;  // consumed bytes
-    }
-
-    private parseAdaptationField(buffer: ArrayBuffer, offset: number, length: number): {
-        discontinuity_indicator?: number,
-        random_access_indicator?: number,
-        elementary_stream_priority_indicator?: number
-    } {
-        let data = new Uint8Array(buffer, offset, length);
-
-        let adaptation_field_length = data[0];
-        if (adaptation_field_length > 0) {
-            if (adaptation_field_length > 183) {
-                Log.w(this.TAG, `Illegal adaptation_field_length: ${adaptation_field_length}`);
-                return {};
-            }
-
-            let discontinuity_indicator: number = (data[1] & 0x80) >>> 7;
-            let random_access_indicator: number = (data[1] & 0x40) >>> 6;
-            let elementary_stream_priority_indicator: number = (data[1] & 0x20) >>> 5;
-
-            return {
-                discontinuity_indicator,
-                random_access_indicator,
-                elementary_stream_priority_indicator
-            };
-        }
-
-        return {};
     }
 
     private handleSectionSlice(buffer: ArrayBuffer, offset: number, length: number, misc: any): void {
@@ -578,21 +572,8 @@ class TSDemuxer extends BaseDemuxer {
             let dts: number | undefined;
 
             if (PTS_DTS_flags === 0x02 || PTS_DTS_flags === 0x03) {
-                pts = (data[9] & 0x0E) * 536870912 + // 1 << 29
-                      (data[10] & 0xFF) * 4194304 + // 1 << 22
-                      (data[11] & 0xFE) * 16384 + // 1 << 14
-                      (data[12] & 0xFF) * 128 + // 1 << 7
-                      (data[13] & 0xFE) / 2;
-
-                if (PTS_DTS_flags === 0x03) {
-                    dts = (data[14] & 0x0E) * 536870912 + // 1 << 29
-                          (data[15] & 0xFF) * 4194304 + // 1 << 22
-                          (data[16] & 0xFE) * 16384 + // 1 << 14
-                          (data[17] & 0xFF) * 128 + // 1 << 7
-                          (data[18] & 0xFE) / 2;
-                } else {
-                    dts = pts;
-                }
+                pts = this.getTimestamp(data, 9);
+                dts = PTS_DTS_flags === 0x03 ? this.getTimestamp(data, 14) : pts;
             }
 
             let payload_start_index = 6 + 3 + PES_header_data_length;
@@ -622,6 +603,8 @@ class TSDemuxer extends BaseDemuxer {
                         this.parseAC3Payload(payload, pts);
                     } else if (this.pmt_.common_pids.eac3 === pes_data.pid) {
                         this.parseEAC3Payload(payload, pts);
+                    } else if (this.pmt_.asynchronous_klv_pids[pes_data.pid]) {
+                        this.parseAsynchronousKLVMetadataPayload(payload, pes_data.pid, stream_id);
                     } else if (this.pmt_.smpte2038_pids[pes_data.pid]) {
                         this.parseSMPTE2038MetadataPayload(payload, pts, dts, pes_data.pid, stream_id);
                     } else {
@@ -640,8 +623,12 @@ class TSDemuxer extends BaseDemuxer {
                 case StreamType.kEAC3:
                     this.parseEAC3Payload(payload, pts);
                     break;
-                case StreamType.kID3:
-                    this.parseTimedID3MetadataPayload(payload, pts, dts, pes_data.pid, stream_id);
+                case StreamType.kMetadata:
+                    if (this.pmt_.timed_id3_pids[pes_data.pid]) {
+                        this.parseTimedID3MetadataPayload(payload, pts, dts, pes_data.pid, stream_id);
+                    } else if (this.pmt_.synchronous_klv_pids[pes_data.pid]) {
+                        this.parseSynchronousKLVMetadataPayload(payload, pts, dts, pes_data.pid, stream_id);
+                    }
                     break;
                 case StreamType.kH264:
                     this.parseH264Payload(payload, pts, dts, pes_data.file_position, pes_data.random_access_indicator);
@@ -768,7 +755,7 @@ class TSDemuxer extends BaseDemuxer {
             }
         }
 
-        let PCR_PID = ((data[8] & 0x1F) << 8) | data[9];
+        pmt.pcr_pid = ((data[8] & 0x1F) << 8) | data[9];
         let program_info_length = ((data[10] & 0x0F) << 8) | data[11];
 
         let info_start_index = 12 + program_info_length;
@@ -816,6 +803,8 @@ class TSDemuxer extends BaseDemuxer {
                                 pmt.common_pids.eac3 = elementary_PID; // DVB EAC-3 (FIXME: NEED VERIFY)
                             } */ else if (registration === 'Opus') {
                                 pmt.common_pids.opus = elementary_PID;
+                            } else if (registration === 'KLVA') {
+                                pmt.asynchronous_klv_pids[elementary_PID] = true;
                             }
                         } else if (tag === 0x7F) {  // DVB extension descriptor
                             if (elementary_PID === pmt.common_pids.opus) {
@@ -859,8 +848,36 @@ class TSDemuxer extends BaseDemuxer {
                     let descriptors = data.subarray(i + 5, i + 5 + ES_info_length);
                     this.dispatchPESPrivateDataDescriptor(elementary_PID, stream_type, descriptors);
                 }
-            } else if (stream_type === StreamType.kID3) {
-                pmt.timed_id3_pids[elementary_PID] = true;
+            } else if (stream_type === StreamType.kMetadata) {
+                if (ES_info_length > 0) {
+                    // parse descriptor for PES private data
+                    for (let offset = i + 5; offset < i + 5 + ES_info_length; ) {
+                        let tag = data[offset + 0];
+                        let length = data[offset + 1];
+
+                        if (tag === 0x26) {
+                            let metadata_application_format = (data[offset + 2] << 8) | (data[offset + 3] << 0);
+                            let metadata_application_format_identifier = null;
+                            if (metadata_application_format === 0xFFFF) {
+                                metadata_application_format_identifier = String.fromCharCode(... Array.from(data.subarray(offset + 4, offset + 4 + 4)));
+                            }
+                            let metadata_format = data[offset + 4 + (metadata_application_format === 0xFFFF ? 4 : 0)];
+                            let metadata_format_identifier = null;
+                            if (metadata_format === 0xFF) {
+                                let pad = 4 + (metadata_application_format === 0xFFFF ? 4 : 0) + 1;
+                                metadata_format_identifier = String.fromCharCode(... Array.from(data.subarray(offset + pad, offset + pad + 4)));
+                            }
+
+                            if (metadata_application_format_identifier === 'ID3 ' && metadata_format_identifier === 'ID3 ') {
+                                pmt.timed_id3_pids[elementary_PID] = true;
+                            } else if (metadata_format_identifier === 'KLVA') {
+                                pmt.synchronous_klv_pids[elementary_PID] = true;
+                            }
+                        }
+
+                        offset += 2 + length;
+                    }
+                }
             } else if (stream_type === StreamType.kSCTE35) {
                 pmt.scte_35_pids[elementary_PID] = true;
             }
@@ -889,7 +906,7 @@ class TSDemuxer extends BaseDemuxer {
             let pts_ms = Math.floor(scte35.pts / this.timescale_);
             scte35.pts = pts_ms;
         } else {
-            scte35.nearest_pts = this.aac_last_sample_pts_;
+            scte35.nearest_pts = this.getNearestTimestampMilliseconds();
         }
 
         if (this.onSCTE35Metadata) {
@@ -1202,17 +1219,17 @@ class TSDemuxer extends BaseDemuxer {
             base_pts_ms = pts / this.timescale_;
         }
         if (this.audio_metadata_.codec === 'aac') {
-            if (pts == undefined && this.aac_last_sample_pts_ != undefined) {
+            if (pts == undefined && this.audio_last_sample_pts_ != undefined) {
                 ref_sample_duration = 1024 / this.audio_metadata_.sampling_frequency * 1000;
-                base_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                base_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
             } else if (pts == undefined){
                 Log.w(this.TAG, `AAC: Unknown pts`);
                 return;
             }
 
-            if (this.aac_last_incomplete_data_ && this.aac_last_sample_pts_) {
+            if (this.aac_last_incomplete_data_ && this.audio_last_sample_pts_) {
                 ref_sample_duration = 1024 / this.audio_metadata_.sampling_frequency * 1000;
-                let new_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                let new_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
 
                 if (Math.abs(new_pts_ms - base_pts_ms) > 1) {
                     Log.w(this.TAG, `AAC: Detected pts overlapped, ` +
@@ -1270,7 +1287,7 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (last_sample_pts_ms) {
-            this.aac_last_sample_pts_ = last_sample_pts_ms;
+            this.audio_last_sample_pts_ = last_sample_pts_ms;
         }
     }
 
@@ -1295,17 +1312,17 @@ class TSDemuxer extends BaseDemuxer {
             base_pts_ms = pts / this.timescale_;
         }
         if (this.audio_metadata_.codec === 'aac') {
-            if (pts == undefined && this.aac_last_sample_pts_ != undefined) {
+            if (pts == undefined && this.audio_last_sample_pts_ != undefined) {
                 ref_sample_duration = 1024 / this.audio_metadata_.sampling_frequency * 1000;
-                base_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                base_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
             } else if (pts == undefined){
                 Log.w(this.TAG, `AAC: Unknown pts`);
                 return;
             }
 
-            if (this.aac_last_incomplete_data_ && this.aac_last_sample_pts_) {
+            if (this.aac_last_incomplete_data_ && this.audio_last_sample_pts_) {
                 ref_sample_duration = 1024 / this.audio_metadata_.sampling_frequency * 1000;
-                let new_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                let new_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
 
                 if (Math.abs(new_pts_ms - base_pts_ms) > 1) {
                     Log.w(this.TAG, `AAC: Detected pts overlapped, ` +
@@ -1364,7 +1381,7 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (last_sample_pts_ms) {
-            this.aac_last_sample_pts_ = last_sample_pts_ms;
+            this.audio_last_sample_pts_ = last_sample_pts_ms;
         }
     }
 
@@ -1383,9 +1400,9 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (this.audio_metadata_.codec === 'ac-3') {
-            if (pts == undefined && this.aac_last_sample_pts_ != undefined) {
-                ref_sample_duration = 1536 / this.audio_metadata_.sampling_frequency * 1000;;
-                base_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+            if (pts == undefined && this.audio_last_sample_pts_ != undefined) {
+                ref_sample_duration = 1536 / this.audio_metadata_.sampling_frequency * 1000;
+                base_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
             } else if (pts == undefined){
                 Log.w(this.TAG, `AC3: Unknown pts`);
                 return;
@@ -1438,7 +1455,7 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (last_sample_pts_ms) {
-            this.aac_last_sample_pts_ = last_sample_pts_ms;
+            this.audio_last_sample_pts_ = last_sample_pts_ms;
         }
     }
 
@@ -1457,9 +1474,9 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (this.audio_metadata_.codec === 'ec-3') {
-            if (pts == undefined && this.aac_last_sample_pts_ != undefined) {
+            if (pts == undefined && this.audio_last_sample_pts_ != undefined) {
                 ref_sample_duration = (256 * this.audio_metadata_.num_blks) / this.audio_metadata_.sampling_frequency * 1000; // TODO: AEC3 BLK
-                base_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                base_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
             } else if (pts == undefined){
                 Log.w(this.TAG, `EAC3: Unknown pts`);
                 return;
@@ -1512,7 +1529,7 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (last_sample_pts_ms) {
-            this.aac_last_sample_pts_ = last_sample_pts_ms;
+            this.audio_last_sample_pts_ = last_sample_pts_ms;
         }
     }
 
@@ -1530,9 +1547,9 @@ class TSDemuxer extends BaseDemuxer {
             base_pts_ms = pts / this.timescale_;
         }
         if (this.audio_metadata_.codec === 'opus') {
-            if (pts == undefined && this.aac_last_sample_pts_ != undefined) {
+            if (pts == undefined && this.audio_last_sample_pts_ != undefined) {
                 ref_sample_duration = 20;
-                base_pts_ms = this.aac_last_sample_pts_ + ref_sample_duration;
+                base_pts_ms = this.audio_last_sample_pts_ + ref_sample_duration;
             } else if (pts == undefined){
                 Log.w(this.TAG, `Opus: Unknown pts`);
                 return;
@@ -1577,7 +1594,7 @@ class TSDemuxer extends BaseDemuxer {
         }
 
         if (last_sample_pts_ms) {
-            this.aac_last_sample_pts_ = last_sample_pts_ms;
+            this.audio_last_sample_pts_ = last_sample_pts_ms;
         }
     }
 
@@ -1871,7 +1888,7 @@ class TSDemuxer extends BaseDemuxer {
             let pts_ms = Math.floor(pts / this.timescale_);
             private_data.pts = pts_ms;
         } else {
-            private_data.nearest_pts = this.aac_last_sample_pts_;
+            private_data.nearest_pts = this.getNearestTimestampMilliseconds();
         }
 
         if (dts != undefined) {
@@ -1907,6 +1924,44 @@ class TSDemuxer extends BaseDemuxer {
         }
     }
 
+    private parseSynchronousKLVMetadataPayload(data: Uint8Array, pts: number, dts: number, pid: number, stream_id: number) {
+        let synchronous_klv_metadata = new KLVData();
+
+        synchronous_klv_metadata.pid = pid;
+        synchronous_klv_metadata.stream_id = stream_id;
+        synchronous_klv_metadata.len = data.byteLength;
+        synchronous_klv_metadata.data = data;
+
+        if (pts != undefined) {
+            let pts_ms = Math.floor(pts / this.timescale_);
+            synchronous_klv_metadata.pts = pts_ms;
+        }
+
+        if (dts != undefined) {
+            let dts_ms = Math.floor(dts / this.timescale_);
+            synchronous_klv_metadata.dts = dts_ms;
+        }
+
+        synchronous_klv_metadata.access_units = klv_parse(data);
+
+        if (this.onSynchronousKLVMetadata) {
+            this.onSynchronousKLVMetadata(synchronous_klv_metadata);
+        }
+    }
+
+    private parseAsynchronousKLVMetadataPayload(data: Uint8Array, pid: number, stream_id: number) {
+        let asynchronous_klv_metadata = new PESPrivateData();
+
+        asynchronous_klv_metadata.pid = pid;
+        asynchronous_klv_metadata.stream_id = stream_id;
+        asynchronous_klv_metadata.len = data.byteLength;
+        asynchronous_klv_metadata.data = data;
+
+        if (this.onAsynchronousKLVMetadata) {
+            this.onAsynchronousKLVMetadata(asynchronous_klv_metadata);
+        }
+    }
+
     private parseSMPTE2038MetadataPayload(data: Uint8Array, pts: number, dts: number, pid: number, stream_id: number) {
         let smpte2038_data = new SMPTE2038Data();
 
@@ -1919,7 +1974,7 @@ class TSDemuxer extends BaseDemuxer {
             let pts_ms = Math.floor(pts / this.timescale_);
             smpte2038_data.pts = pts_ms;
         }
-        smpte2038_data.nearest_pts = this.aac_last_sample_pts_;
+        smpte2038_data.nearest_pts = this.getNearestTimestampMilliseconds();
 
         if (dts != undefined) {
             let dts_ms = Math.floor(dts / this.timescale_);
@@ -1931,6 +1986,47 @@ class TSDemuxer extends BaseDemuxer {
             this.onSMPTE2038Metadata(smpte2038_data);
         }
     }
+
+    private getNearestTimestampMilliseconds(): number | undefined {
+        // Prefer using last audio sample pts if audio track exists
+        if (this.audio_last_sample_pts_ != undefined) {
+            return Math.floor(this.audio_last_sample_pts_);
+        } else if (this.last_pcr_ != undefined) {
+            // Fallback to PCR time if audio track doesn't exist
+            const pcr_time_ms = Math.floor(this.last_pcr_ / 300 / this.timescale_);
+            return pcr_time_ms;
+        }
+        return undefined;
+    }
+
+    private getPcrBase(data: Uint8Array): number {
+        let pcr_base = data[6] * 33554432 // 1 << 25
+            + data[7] * 131072 // 1 << 17
+            + data[8] * 512 // 1 << 9
+            + data[9] * 2 // 1 << 1
+            + (data[10] & 0x80) / 128 // 1 >> 7
+            + this.timestamp_offset_;
+        if (pcr_base + 0x100000000 < this.last_pcr_base_) {
+            pcr_base += 0x200000000; // pcr_base wraparound
+            this.timestamp_offset_ += 0x200000000;
+        }
+        this.last_pcr_base_ = pcr_base;
+        return pcr_base;
+    }
+
+    private getTimestamp(data: Uint8Array, pos: number): number {
+        let timestamp = (data[pos] & 0x0E) * 536870912 // 1 << 29
+            + (data[pos + 1] & 0xFF) * 4194304 // 1 << 22
+            + (data[pos + 2] & 0xFE) * 16384 // 1 << 14
+            + (data[pos + 3] & 0xFF) * 128 // 1 << 7
+            + (data[pos + 4] & 0xFE) / 2
+            + this.timestamp_offset_;
+        if (timestamp + 0x100000000 < this.last_pcr_base_) {
+            timestamp += 0x200000000; // pts/dts wraparound
+        }
+        return timestamp;
+    }
+
 }
 
 export default TSDemuxer;

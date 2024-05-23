@@ -22,8 +22,8 @@
                     <label for="isLive">isLive</label>
                     <input type="checkbox" id="withCredentials" onchange="saveSettings()" />
                     <label for="withCredentials">withCredentials</label>
-                    <input type="checkbox" id="liveBufferLatencyChasing" onchange="saveSettings()" checked />
-                    <label for="liveBufferLatencyChasing">liveBufferLatencyChasing</label>
+                    <input type="checkbox" id="liveSync" onchange="saveSettings()" checked />
+                    <label for="liveSync">liveSync</label>
                     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
                     <label>aribb24.js source:</label>
                     <input type="radio" id="radio_private_stream_1" value="private_stream_1" name="aribCaptionTransmitMode" onchange="saveSettings()" checked>
@@ -42,7 +42,7 @@
         </div>
         <div class="video-container">
             <div>
-                <video name="videoElement" class="centeredVideo" controls autoplay>
+                <video name="videoElement" class="centeredVideo" controls autoplay playsinline>
                     Your browser is too old which doesn't support HTML5 video.
                 </video>
             </div>
@@ -59,10 +59,10 @@
     </div>
 
     <script src="../dist/mpegts.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/aribb24.js@1.6.12/dist/aribb24.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/aribb24.js@1.10.1/dist/aribb24.js"></script>
 
     <script>
-        var checkBoxFields = ['isLive', 'withCredentials', 'liveBufferLatencyChasing'];
+        var checkBoxFields = ['isLive', 'withCredentials', 'liveSync'];
         var streamURL, mediaSourceURL;
         var arib_caption_transmit_mode;
 
@@ -127,8 +127,9 @@
                 }
             }
             player = mpegts.createPlayer(mediaDataSource, {
-                enableWorker: false,
-                liveBufferLatencyChasing: document.getElementById('liveBufferLatencyChasing').checked,
+                enableWorker: true,
+                enableWorkerForMSE: true,
+                liveSync: document.getElementById('liveSync').checked,
             });
             player.attachMediaElement(element);
             player.load();
@@ -173,12 +174,46 @@
                 }
             });
 
+            /*
+            var process = [];
+            player.on(mpegts.Events.SMPTE2038_METADATA_ARRIVED, function(data) {
+                const pts = data.pts;
+
+                for (const ancillary of data.ancillaries) {
+                    const { user_data } = ancillary;
+
+                    // header 4 byte
+                    const end_packet_flag = (user_data[2] & 0x20) !== 0;
+                    const start_packet_flag = (user_data[2] & 0x40) !== 0;
+
+                    // timing 12 byte
+
+                    if (start_packet_flag && end_packet_flag) {
+                        const offset = 16;
+                        const packet = user_data.slice(offset, offset + 188);
+                        const header = 4;
+                        const adaptation_field_length = packet[header];
+                        const pes = packet.slice(header + 1 + adaptation_field_length);
+                        const pes_header = 6;
+                        const pes_offset = pes_header + 3 + pes[pes_header + 2];
+                        const data = pes.slice(pes_offset);
+                        captionRenderer.pushData(data.pid, data, pts / 1000);
+                        console.log(pts, Array.from(data).map((e) => e.toString(16)))
+                    }
+                }
+            });
+            */
+
             player.on(mpegts.Events.TIMED_ID3_METADATA_ARRIVED, function(data) {
                 if (arib_caption_transmit_mode !== 'timed_id3') {
                     return;
                 }
                 captionRenderer.pushID3v2Data(data.pts / 1000, data.data);
             });
+
+            player.on(mpegts.Events.ASYNCHRONOUS_KLV_METADATA_ARRIVED, function(data) {
+                console.log('sync', data);
+            })
 
             player.on(mpegts.Events.PES_PRIVATE_DATA_DESCRIPTOR, function(data) {
                 // var str = JSON.stringify(data);
